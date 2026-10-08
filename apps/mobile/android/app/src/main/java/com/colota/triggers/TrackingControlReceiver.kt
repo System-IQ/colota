@@ -20,7 +20,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 /**
- * Exported broadcast receiver that starts and stops tracking from automation apps.
+ * Exported broadcast receiver that starts and stops tracking from automation apps,
+ * plus remote GPS control actions.
  */
 class TrackingControlReceiver : BroadcastReceiver() {
 
@@ -28,12 +29,14 @@ class TrackingControlReceiver : BroadcastReceiver() {
         private const val TAG = "TrackingControlReceiver"
         const val ACTION_START = "com.Colota.action.START_TRACKING"
         const val ACTION_STOP = "com.Colota.action.STOP_TRACKING"
+        const val ACTION_ENABLE_GPS = "com.Colota.action.ENABLE_GPS"
+        const val ACTION_DISABLE_GPS = "com.Colota.action.DISABLE_GPS"
+        const val ACTION_ENABLE_AUTO_GPS = "com.Colota.action.ENABLE_AUTO_GPS"
+        const val ACTION_DISABLE_AUTO_GPS = "com.Colota.action.DISABLE_AUTO_GPS"
     }
 
     override fun onReceive(context: Context, intent: Intent) {
         val action = intent.action ?: return
-        if (action != ACTION_START && action != ACTION_STOP) return
-
         val appContext = context.applicationContext
         val pending = goAsync()
 
@@ -42,9 +45,22 @@ class TrackingControlReceiver : BroadcastReceiver() {
                 when (action) {
                     ACTION_START -> handleStart(appContext)
                     ACTION_STOP -> handleStop(appContext)
+                    ACTION_ENABLE_GPS -> {
+                        GpsController.setGps(appContext, true)
+                    }
+                    ACTION_DISABLE_GPS -> {
+                        GpsController.setGps(appContext, false)
+                    }
+                    ACTION_ENABLE_AUTO_GPS -> {
+                        GpsController.setGps(appContext, true)
+                        GpsStateWatcher.setAutoEnabled(appContext, true)
+                    }
+                    ACTION_DISABLE_AUTO_GPS -> {
+                        GpsStateWatcher.setAutoEnabled(appContext, false)
+                    }
                 }
             } catch (e: Exception) {
-                AppLogger.e(TAG, "Error handling broadcast", e)
+                AppLogger.e(TAG, "Error handling broadcast $action", e)
             } finally {
                 pending.finish()
             }

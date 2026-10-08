@@ -14,6 +14,7 @@ import com.facebook.react.ReactNativeApplicationEntryPoint.loadReactNative
 import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
 import com.Colota.backup.BackupOrphanCleanup
 import com.Colota.bridge.LocationServicePackage
+import com.Colota.triggers.GpsStateWatcher
 import com.Colota.util.FileLoggerInitializer
 import com.Colota.util.MemoryPressureLogger
 
@@ -31,6 +32,10 @@ class MainApplication : Application(), ReactApplication {
         FileLoggerInitializer.start(this)
         loadReactNative(this)
         BackupOrphanCleanup.start(this)
+        // Restore auto-GPS watcher if it was enabled before the process restart
+        if (GpsStateWatcher.isAutoEnabled(this)) {
+            GpsStateWatcher.register(this)
+        }
     }
 
     override fun onTrimMemory(level: Int) {
