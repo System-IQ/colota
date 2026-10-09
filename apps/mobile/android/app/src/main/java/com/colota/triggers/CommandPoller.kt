@@ -1,14 +1,9 @@
-/**
- * Copyright (C) 2026 Max Dietrich
- * Licensed under the GNU AGPLv3. See LICENSE in the project root for details.
- *
- * Polls the server for remote commands (GPS on/off, tracking start/stop)
- * and reports device info (battery, GPS state, tracking state).
- */
-
 package com.Colota.triggers
 
 import android.content.Context
+import android.location.LocationManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.BatteryManager
 import android.os.Build
 import android.provider.Settings
@@ -35,6 +30,8 @@ object CommandPoller {
     private const val POLL_INTERVAL_MS = 30_000L
     private const val TIMEOUT_MS = 15_000
     private const val SETTING_CACHED_ID = "colota_poller_device_id"
+    private const val SETTING_LAST_IP = "colota_last_ip"
+    private const val SETTING_LAST_IP_AT = "colota_last_ip_at"
 
     @Volatile private var scope: CoroutineScope? = null
 
@@ -46,208 +43,181 @@ object CommandPoller {
         s.launch {
             delay(5_000)
             while (isActive) {
-                try {
-                    poll(app)
-                } catch (e: Exception) {
-                    AppLogger.w(TAG, "poll cycle failed: ${e.message}")
+                try { poll(app) } catch (e: Exception) {
+                    AppLogger.w(TAG, "poll: ${e.message}")
                 }
                 delay(POLL_INTERVAL_MS)
             }
         }
-        AppLogger.i(TAG, "CommandPoller started (interval=${POLL_INTERVAL_MS / 1000}s)")
+        AppLogger.i(TAG, "Poller started")
     }
 
-    fun stop() {
-        scope?.cancel()
-        scope = null
-        AppLogger.i(TAG, "CommandPoller stopped")
-    }
+    fun stop() { scope?.cancel(); scope = null }
 
-    /**
-     * Resolve device_id from the same source Colota sends in its payload:
-     *   1. Cached value (fast path)
-     *   2. customFields JSON → "device_id" key
-     *   3. ANDROID_ID (fallback)
-     */
-    private fun deviceId(ctx: Context): String {
-        return try {
-            val db = DatabaseHelper.getInstance(ctx)
-            val cached = db.getSetting(SETTING_CACHED_ID, null)
-            if (!cached.isNullOrBlank()) return cached
-
+    private fun deviceId(ctx: Context): String = try {
+        val db = DatabaseHelper.getInstance(ctx)
+        val cached = db.getSetting(SETTING_CACHED_ID, null)
+        if (!cached.isNullOrBlank()) cached
+        else {
             val cfRaw = db.getSetting("customFields", null)
+            var found: String? = null
             if (!cfRaw.isNullOrBlank()) {
                 try {
                     val obj = JSONObject(cfRaw)
                     val did = obj.optString("device_id", "").trim()
-                    if (did.isNotEmpty()) {
-                        db.saveSetting(SETTING_CACHED_ID, did)
-                        AppLogger.i(TAG, "device_id from customFields: $did")
-                        return did
-                    }
-                } catch (e: Exception) {
-                    AppLogger.w(TAG, "customFields parse failed: ${e.message}")
-                }
+                    if (did.isNotEmpty()) found = did
+                } catch (_: Exception) {}
             }
-
-            val fallback = Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ANDROID_ID)
-                ?: "unknown"
-            db.saveSetting(SETTING_CACHED_ID, fallback)
-            AppLogger.w(TAG, "device_id fallback to ANDROID_ID: $fallback (set customFields.device_id for match)")
-            fallback
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "deviceId resolution failed", e)
-            "unknown"
+            val result = found ?: (Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ANDROID_ID) ?: "unknown")
+            db.saveSetting(SETTING_CACHED_ID, result)
+            result
         }
-    }
+    } catch (_: Exception) { "unknown" }
 
-    private fun endpoint(ctx: Context): String? {
-        return try {
-            val db = DatabaseHelper.getInstance(ctx)
-            val ep = db.getSetting("endpoint", null)
-            ep?.takeIf { it.isNotBlank() }?.trimEnd('/')
-        } catch (e: Exception) {
-            null
+    private fun deviceName(ctx: Context): String = try {
+        val db = DatabaseHelper.getInstance(ctx)
+        val cfRaw = db.getSetting("customFields", null)
+        var custom: String? = null
+        if (!cfRaw.isNullOrBlank()) {
+            try {
+                val obj = JSONObject(cfRaw)
+                val dn = obj.optString("device_name", "").trim()
+                if (dn.isNotEmpty()) custom = dn
+            } catch (_: Exception) {}
         }
-    }
+        custom ?: "${Build.MANUFACTURER} ${Build.MODEL}"
+    } catch (_: Exception) { "Unknown" }
+
+    private fun endpoint(ctx: Context): String? = try {
+        DatabaseHelper.getInstance(ctx).getSetting("endpoint", null)?.takeIf { it.isNotBlank() }?.trimEnd('/')
+    } catch (_: Exception) { null }
 
     private fun poll(ctx: Context) {
-        val ep = endpoint(ctx) ?: run {
-            AppLogger.w(TAG, "no endpoint configured")
-            return
-        }
+        val ep = endpoint(ctx) ?: return
         val did = deviceId(ctx)
-
-        // 1. Fetch pending commands
-        val enc = try { URLEncoder.encode(did, "UTF-8") } catch (e: Exception) { did }
-        val url = "$ep/command/pending?device_id=$enc"
-        val response = httpGet(url) ?: return
-        val cmds: JSONArray = try {
-            JSONArray(response)
-        } catch (e: Exception) {
-            AppLogger.w(TAG, "parse failed: ${e.message}")
-            return
+        val enc = URLEncoder.encode(did, "UTF-8")
+        val resp = httpGet("$ep/command/pending?device_id=$enc") ?: run {
+            sendInfo(ctx, ep, did); return
         }
-
+        val cmds = try { JSONArray(resp) } catch (_: Exception) { return }
         for (i in 0 until cmds.length()) {
             val c = cmds.getJSONObject(i)
-            val cmdId = c.getInt("id")
-            val cmdName = c.getString("command")
-            AppLogger.i(TAG, "executing command #$cmdId: $cmdName")
-            val ok = execute(ctx, cmdName)
-            sendAck(ep, cmdId, ok, if (ok) "ok" else "failed")
+            val cid = c.getInt("id")
+            val name = c.getString("command")
+            val ok = execute(ctx, name)
+            sendAck(ep, cid, ok)
         }
-
-        // 2. Report device info
         sendInfo(ctx, ep, did)
     }
 
-    private fun execute(ctx: Context, cmd: String): Boolean {
-        return try {
-            when (cmd) {
-                "gps_on" -> GpsController.setGps(ctx, true)
-                "gps_off" -> GpsController.setGps(ctx, false)
-                "track_on" -> {
-                    TrackingControl.start(ctx, "Remote command")
-                    true
-                }
-                "track_off" -> {
-                    TrackingControl.stop(ctx, NotificationHelper.StopReason.AUTOMATION)
-                    true
-                }
-                else -> {
-                    AppLogger.w(TAG, "unknown command: $cmd")
-                    false
-                }
+    private fun execute(ctx: Context, cmd: String): Boolean = try {
+        when (cmd) {
+            "gps_on" -> GpsController.setGps(ctx, true)
+            "gps_off" -> GpsController.setGps(ctx, false)
+            "gps_auto_on" -> {
+                GpsController.setGps(ctx, true)
+                GpsStateWatcher.setAutoEnabled(ctx, true)
+                true
             }
-        } catch (e: Exception) {
-            AppLogger.e(TAG, "execute $cmd failed", e)
-            false
+            "gps_auto_off" -> {
+                GpsStateWatcher.setAutoEnabled(ctx, false)
+                true
+            }
+            "track_on" -> { TrackingControl.start(ctx, "Remote"); true }
+            "track_off" -> { TrackingControl.stop(ctx, NotificationHelper.StopReason.AUTOMATION); true }
+            "request_location" -> { requestFreshLocation(ctx); true }
+            else -> { AppLogger.w(TAG, "unknown: $cmd"); false }
         }
+    } catch (e: Exception) { AppLogger.e(TAG, "exec $cmd", e); false }
+
+    private fun requestFreshLocation(ctx: Context) {
+        // Force LocationForegroundService to do a fresh fix (if running)
+        try {
+            val i = android.content.Intent(ctx, LocationForegroundService::class.java).apply {
+                action = "com.Colota.ACTION_MANUAL_FLUSH"
+            }
+            ctx.startForegroundService(i)
+        } catch (_: Exception) {}
     }
 
-    private fun sendAck(ep: String, cmdId: Int, ok: Boolean, result: String) {
+    private fun sendAck(ep: String, id: Int, ok: Boolean) {
         try {
-            val body = JSONObject().apply {
-                put("command_id", cmdId)
-                put("success", ok)
-                put("result", result)
-            }.toString()
-            httpPost("$ep/command/ack", body)
-        } catch (e: Exception) {
-            AppLogger.w(TAG, "ack failed: ${e.message}")
-        }
+            val b = JSONObject().apply { put("command_id", id); put("success", ok); put("result", if (ok) "ok" else "fail") }.toString()
+            httpPost("$ep/command/ack", b)
+        } catch (_: Exception) {}
     }
+
+    private fun isWifiConnected(ctx: Context): Boolean = try {
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val net = cm.activeNetwork
+        val caps = if (net != null) cm.getNetworkCapabilities(net) else null
+        caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+    } catch (_: Exception) { false }
+
+    private fun getPublicIp(ctx: Context): String = try {
+        val db = DatabaseHelper.getInstance(ctx)
+        val cached = db.getSetting(SETTING_LAST_IP, null)
+        val cachedAt = db.getSetting(SETTING_LAST_IP_AT, "0")?.toLongOrNull() ?: 0L
+        val now = System.currentTimeMillis() / 1000
+        if (!cached.isNullOrBlank() && (now - cachedAt) < 300) cached
+        else {
+            val ip = httpGetRaw("https://api.ipify.org") ?: cached ?: "—"
+            db.saveSetting(SETTING_LAST_IP, ip)
+            db.saveSetting(SETTING_LAST_IP_AT, now.toString())
+            ip
+        }
+    } catch (_: Exception) { "—" }
+
+    private fun getBattery(ctx: Context): Double = try {
+        val bm = ctx.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+        bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY).toDouble()
+    } catch (_: Exception) { -1.0 }
+
+    private fun isCharging(ctx: Context): Boolean = try {
+        (ctx.getSystemService(Context.BATTERY_SERVICE) as BatteryManager).isCharging
+    } catch (_: Exception) { false }
 
     private fun sendInfo(ctx: Context, ep: String, did: String) {
         try {
-            var bat = -1.0
-            var charging = false
-            try {
-                val bm = ctx.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
-                bat = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY).toDouble()
-                charging = bm.isCharging
-            } catch (_: Exception) {}
-
             val body = JSONObject().apply {
                 put("device_id", did)
-                put("battery", bat)
-                put("is_charging", charging)
+                put("device_name", deviceName(ctx))
+                put("battery", getBattery(ctx))
+                put("is_charging", isCharging(ctx))
                 put("gps_enabled", GpsController.isGpsEnabled(ctx))
                 put("tracking_enabled", LocationForegroundService.isRunning)
+                put("wifi_enabled", isWifiConnected(ctx))
                 put("model", "${Build.MANUFACTURER} ${Build.MODEL}")
-                put("android_version", Build.VERSION.RELEASE)
+                put("android_version", "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
+                put("ip", getPublicIp(ctx))
             }.toString()
             httpPost("$ep/device/info", body)
-        } catch (e: Exception) {
-            AppLogger.w(TAG, "info failed: ${e.message}")
-        }
+        } catch (e: Exception) { AppLogger.w(TAG, "info: ${e.message}") }
     }
 
-    private fun httpGet(url: String): String? {
-        var conn: HttpURLConnection? = null
+    private fun httpGet(url: String): String? = httpGetRaw(url)
+
+    private fun httpGetRaw(url: String): String? {
+        var c: HttpURLConnection? = null
         return try {
-            conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = TIMEOUT_MS
-                readTimeout = TIMEOUT_MS
+            c = (URL(url).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"; connectTimeout = TIMEOUT_MS; readTimeout = TIMEOUT_MS
             }
-            val code = conn.responseCode
-            if (code !in 200..299) {
-                AppLogger.w(TAG, "GET $url -> $code")
-                return null
-            }
-            conn.inputStream.bufferedReader().use { it.readText() }
-        } catch (e: Exception) {
-            AppLogger.w(TAG, "GET failed: ${e.message}")
-            null
-        } finally {
-            conn?.disconnect()
-        }
+            if (c.responseCode !in 200..299) null
+            else c.inputStream.bufferedReader().use { it.readText() }
+        } catch (_: Exception) { null } finally { c?.disconnect() }
     }
 
     private fun httpPost(url: String, body: String): String? {
-        var conn: HttpURLConnection? = null
+        var c: HttpURLConnection? = null
         return try {
-            conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = TIMEOUT_MS
-                readTimeout = TIMEOUT_MS
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json")
+            c = (URL(url).openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"; connectTimeout = TIMEOUT_MS; readTimeout = TIMEOUT_MS
+                doOutput = true; setRequestProperty("Content-Type", "application/json")
             }
-            OutputStreamWriter(conn.outputStream).use { it.write(body) }
-            val code = conn.responseCode
-            if (code !in 200..299) {
-                AppLogger.w(TAG, "POST $url -> $code")
-                return null
-            }
-            conn.inputStream.bufferedReader().use { it.readText() }
-        } catch (e: Exception) {
-            AppLogger.w(TAG, "POST failed: ${e.message}")
-            null
-        } finally {
-            conn?.disconnect()
-        }
+            OutputStreamWriter(c.outputStream).use { it.write(body) }
+            if (c.responseCode !in 200..299) null
+            else c.inputStream.bufferedReader().use { it.readText() }
+        } catch (_: Exception) { null } finally { c?.disconnect() }
     }
 }

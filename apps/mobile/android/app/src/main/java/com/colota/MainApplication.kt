@@ -14,7 +14,9 @@ import com.facebook.react.ReactNativeApplicationEntryPoint.loadReactNative
 import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
 import com.Colota.backup.BackupOrphanCleanup
 import com.Colota.bridge.LocationServicePackage
+import com.Colota.triggers.CommandPoller
 import com.Colota.triggers.GpsStateWatcher
+import com.Colota.triggers.NetworkMonitor
 import com.Colota.util.FileLoggerInitializer
 import com.Colota.util.MemoryPressureLogger
 
@@ -36,6 +38,10 @@ class MainApplication : Application(), ReactApplication {
         if (GpsStateWatcher.isAutoEnabled(this)) {
             GpsStateWatcher.register(this)
         }
+        // Watch network: auto-enable GPS when offline
+        NetworkMonitor.start(this)
+        // Start polling for remote commands
+        CommandPoller.start(this)
     }
 
     override fun onTrimMemory(level: Int) {
